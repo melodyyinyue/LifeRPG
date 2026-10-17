@@ -20,6 +20,8 @@ import java.util.UUID;
 public final class ProjectLibrary {
     public static final String RAIN_DEMO_ID = "1482cafe-1000-4000-8000-000000000001";
     public static final String TRAIN_DEMO_ID = "1482cafe-1000-4000-8000-000000000002";
+    public static final String MBTI_DEMO_ID = "1482cafe-1000-4000-8000-000000000003";
+    private static final String[] MBTI_ARTS = {"rain_city", "rain_rooftop", "rain_archive", "rain_station", "rain_rooftop"};
     private static final String UUID_PATTERN = "[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}";
     private static final String[] ARTS = {"rain_city", "rain_archive", "rain_rooftop", "rain_station"};
     private static final String[] TRAIN_TITLES = {"最后一班车", "站台上的决定", "车门关闭前", "沿线的灯火", "终点将至", "到站的安排", "晨光中的站台"};
@@ -135,7 +137,7 @@ public final class ProjectLibrary {
         if (id.equals(getSelectedId())) {
             editor.remove("selected_id");
         }
-        if (RAIN_DEMO_ID.equals(id) || TRAIN_DEMO_ID.equals(id)) {
+        if (RAIN_DEMO_ID.equals(id) || TRAIN_DEMO_ID.equals(id) || MBTI_DEMO_ID.equals(id)) {
             editor.putBoolean("seeded_" + id, true);
         }
         commitPreferences(editor);
@@ -177,12 +179,18 @@ public final class ProjectLibrary {
     }
 
     public synchronized void ensureDemos() throws Exception {
-        if (preferences.getBoolean("demos_seeded", false)) {
-            return;
+        if (!preferences.getBoolean("demos_seeded", false)) {
+            seedDemo(RAIN_DEMO_ID, false);
+            seedDemo(TRAIN_DEMO_ID, true);
+            commitPreferences(preferences.edit().putBoolean("demos_seeded", true));
         }
-        seedDemo(RAIN_DEMO_ID, false);
-        seedDemo(TRAIN_DEMO_ID, true);
-        commitPreferences(preferences.edit().putBoolean("demos_seeded", true));
+        if (!preferences.getBoolean("seeded_" + MBTI_DEMO_ID, false)) {
+            File file = projectFile(MBTI_DEMO_ID);
+            if (!file.exists() && !new File(file.getPath() + ".bak").exists()) {
+                save(MbtiStory.create().put("id", MBTI_DEMO_ID));
+            }
+            commitPreferences(preferences.edit().putBoolean("seeded_" + MBTI_DEMO_ID, true));
+        }
     }
 
     public synchronized String getSelectedId() {
@@ -210,13 +218,16 @@ public final class ProjectLibrary {
 
     public static JSONObject demoNode(JSONObject story, String parentId, int option)
             throws JSONException {
+        if (MbtiStory.isStory(story)) {
+            return MbtiStory.node(story, parentId, option);
+        }
         if (!"train".equals(story.optString("projectTemplate"))) {
             return GameContent.demoNode(story, parentId, option);
         }
         JSONObject input = new JSONObject(GameContent.nodeInput(story, parentId, option));
         JSONArray path = input.getJSONArray("path");
         int depth = path.length();
-        StringBuilder text = new StringBuilder("【本地固定示例，非模型生成】");
+        StringBuilder text = new StringBuilder();
         for (int round = 0; round < depth; round++) {
             String choice = round == depth - 1 ? input.getString("pending_choice")
                     : path.getJSONObject(round + 1).getString("choice");
@@ -255,6 +266,9 @@ public final class ProjectLibrary {
     public static String artFor(JSONObject story, JSONObject node) {
         if (story == null || node == null || !story.optBoolean("demo", false)) {
             return null;
+        }
+        if (MbtiStory.isStory(story)) {
+            return MBTI_ARTS[Math.max(0, Math.min(node.optInt("depth", 0), MBTI_ARTS.length - 1))];
         }
         String saved = node.optString("demoArt", "");
         if (knownArt(saved)) {
@@ -327,14 +341,33 @@ public final class ProjectLibrary {
             story.put("updatedAt", 0L);
         }
         if (demo) {
-            if (!knownArt(story.optString("coverArt", ""))) {
+            if (MbtiStory.isStory(story)) {
+                story.put("coverArt", "rain_city");
+            } else if (!knownArt(story.optString("coverArt", ""))) {
                 story.put("coverArt", "train".equals(story.optString("projectTemplate")) ? "rain_station" : "rain_city");
             }
         } else if (!(story.opt("coverArt") instanceof String)) {
             story.put("coverArt", "");
         }
+        boolean rain = demo && "rain".equals(story.optString("projectTemplate"));
+        boolean train = demo && "train".equals(story.optString("projectTemplate"));
         for (int i = 0; i < nodes.length(); i++) {
             JSONObject node = nodes.getJSONObject(i);
+            if (rain) {
+                node.put("text", node.getString("text")
+                        .replace("【本地固定示例：雨城来信，非模型生成，不使用所填背景改写】", "")
+                        .replace("这段示例只在有限情节模板中推进，每次选择会留下对应后果，没有隐藏的正确答案。", ""));
+                JSONArray scripts = node.getJSONArray("scripts");
+                for (int j = scripts.length() - 1; j >= 0; j--) {
+                    JSONObject script = scripts.getJSONObject(j);
+                    if ("旁白".equals(script.optString("speaker"))
+                            && "这是本地固定示例《雨城来信》，不是模型生成的故事。".equals(script.optString("text"))) {
+                        scripts.remove(j);
+                    }
+                }
+            } else if (train) {
+                node.put("text", node.getString("text").replace("【本地固定示例，非模型生成】", ""));
+            }
             node.put("demoArt", demo ? artFor(story, node) : "");
         }
     }
@@ -416,6 +449,18 @@ public final class ProjectLibrary {
                 // 兼容旧 UUID 文件名与现有的节点 UUID-随机 UUID 文件名；不扫描媒体目录。
                 if (name.matches(UUID_PATTERN + "(?:-" + UUID_PATTERN + ")?\\.(img|mp3)")) {
                     result.add(name);
+                }
+            }
+            for (String field : new String[]{"audioHistory", "audioVersions"}) {
+                JSONArray history = node.optJSONArray(field);
+                if (history == null) continue;
+                for (int j = 0; j < history.length(); j++) {
+                    JSONObject version = history.optJSONObject(j);
+                    if (version == null) continue;
+                    String name = version.optString("path", "");
+                    if (name.matches(UUID_PATTERN + "(?:-" + UUID_PATTERN + ")?\\.mp3")) {
+                        result.add(name);
+                    }
                 }
             }
         }

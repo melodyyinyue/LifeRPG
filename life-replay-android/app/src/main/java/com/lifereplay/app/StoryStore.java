@@ -139,12 +139,22 @@ public class StoryStore {
         JSONArray scripts = new JSONArray();
         for (int i = 0; i < rawScripts.length(); i++) {
             JSONObject script = objectAt(rawScripts, i);
-            String speaker = string(script, "speaker", 500, false).trim();
             String line = string(script, "text", 1000, false);
-            if (!names.contains(speaker)) {
-                throw new JSONException("台词 speaker 必须对应已声明角色");
+            JSONObject validatedScript = new JSONObject();
+            if (script.has("speaker")) {
+                String speaker = string(script, "speaker", 500, false).trim();
+                if (!names.contains(speaker)) {
+                    throw new JSONException("台词 speaker 必须对应已声明角色");
+                }
+                validatedScript.put("speaker", speaker);
+            } else {
+                String sound = line.trim();
+                if (!sound.startsWith("[") || !sound.endsWith("]")
+                        || sound.substring(1, sound.length() - 1).trim().isEmpty()) {
+                    throw new JSONException("无 speaker 的音效必须为非空方括号环境描述");
+                }
             }
-            scripts.put(new JSONObject().put("speaker", speaker).put("text", line));
+            scripts.put(validatedScript.put("text", line));
         }
         JSONArray rawOptions = array(raw, "options");
         if (scene.equals("ending") ? rawOptions.length() != 0
@@ -256,7 +266,8 @@ public class StoryStore {
                 .put("exploration", exploration).put("depth", depth)
                 .put("imageStatus", demo || next.getString("scene_type").equals("transition")
                         ? "skipped" : "pending")
-                .put("audioStatus", demo || next.getJSONArray("scripts").length() == 0
+                .put("audioStatus", demo && "mbti".equals(story.optString("projectTemplate"))
+                        ? "failed" : demo || next.getJSONArray("scripts").length() == 0
                         ? "skipped" : "pending")
                 .put("imagePath", "").put("audioPath", "");
         JSONArray updated = new JSONArray();

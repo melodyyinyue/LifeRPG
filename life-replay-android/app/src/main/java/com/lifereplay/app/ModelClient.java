@@ -56,7 +56,8 @@ public class ModelClient {
     private static final int AUDIO_LIMIT = 20 * 1024 * 1024;
     private static final int PCM_LIMIT = 2 * 1024 * 1024;
     private static final String INSTRUCTION =
-            "严格按照 scripts 中的角色和台词表演，不新增、删改或复述台词。人声清晰，不使用音乐覆盖对白。";
+            "严格按照 scripts 中的角色和台词表演，不新增、删改或复述台词。方括号内容用于生成环境音，"
+                    + "圆括号内容用于指导表演，两者均不朗读。人声清晰，不使用音乐覆盖对白。";
 
     private final Config config;
     private final Trace trace;
@@ -163,13 +164,20 @@ public class ModelClient {
     }
 
     public byte[] speak(JSONArray roles, JSONArray scripts) throws Exception {
+        return speak(roles, scripts, INSTRUCTION);
+    }
+
+    public byte[] speak(JSONArray roles, JSONArray scripts, String instruction) throws Exception {
         return perform("audio", config.audioModel, call -> {
             validateSpeech(call, roles, scripts);
+            if (instruction == null || instruction.trim().isEmpty() || instruction.length() > 500) {
+                throw failure(call, "音频指令必须非空且不超过 500 字符");
+            }
             JSONObject request = new JSONObject()
                     .put("model", requireModel(call, config.audioModel))
                     .put("task", "text_to_audio")
                     .put("roles", roles).put("scripts", scripts)
-                    .put("instruction", INSTRUCTION)
+                    .put("instruction", instruction)
                     .put("response_format", "mp3").put("stream_format", "audio");
             return post(call, config.audioUrl, audioKey(call), request, "audio/mpeg", connection -> {
                 String type = mediaType(connection);
@@ -229,8 +237,8 @@ public class ModelClient {
     }
 
     private void validateSpeech(Call call, JSONArray roles, JSONArray scripts) throws Exception {
-        if (roles == null || scripts == null || roles.length() == 0 || scripts.length() == 0) {
-            throw failure(call, "角色及台词不能为空");
+        if (roles == null || scripts == null || scripts.length() == 0) {
+            throw failure(call, "必须提供角色数组及非空台词数组");
         }
         long roleLength = 0;
         Set<String> names = new HashSet<>();
@@ -251,18 +259,28 @@ public class ModelClient {
         }
         for (int i = 0; i < scripts.length(); i++) {
             JSONObject script = scripts.optJSONObject(i);
-            if (script == null || !(script.opt("speaker") instanceof String)
-                    || !(script.opt("text") instanceof String)
-                    || !names.contains(script.getString("speaker"))) {
-                throw failure(call, "台词必须包含有效 speaker 与 text 字符串");
+            if (script == null || !(script.opt("text") instanceof String)
+                    || script.getString("text").trim().isEmpty()) {
+                throw failure(call, "台词必须包含非空 text 字符串");
+            }
+            if (script.has("speaker")) {
+                if (!(script.opt("speaker") instanceof String)
+                        || script.getString("speaker").trim().isEmpty()
+                        || !names.contains(script.getString("speaker"))) {
+                    throw failure(call, "台词 speaker 必须为非空字符串且对应已声明角色");
+                }
+            } else {
+                String sound = script.getString("text").trim();
+                if (!sound.startsWith("[") || !sound.endsWith("]")
+                        || sound.substring(1, sound.length() - 1).trim().isEmpty()) {
+                    throw failure(call, "无 speaker 的音效必须为非空方括号环境描述");
+                }
             }
         }
         // 保守计入完整序列化内容，包括字段名与标点。
-        if (scripts.toString().length() > 1000) {
+        String serializedScripts = scripts.toString();
+        if (serializedScripts == null || serializedScripts.length() > 1000) {
             throw failure(call, "台词全部字段保守计数超过 1000 字符，请按完整台词分段");
-        }
-        if (INSTRUCTION.length() > 500) {
-            throw failure(call, "音频指令超过 500 字符");
         }
     }
 

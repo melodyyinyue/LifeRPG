@@ -1,5 +1,6 @@
 package com.lifereplay.app;
 
+import android.animation.ValueAnimator;
 import android.content.Context;
 import android.graphics.Bitmap;
 import android.graphics.BitmapFactory;
@@ -21,6 +22,7 @@ import android.view.ScaleGestureDetector;
 import android.view.View;
 import android.view.ViewConfiguration;
 import android.view.accessibility.AccessibilityNodeInfo;
+import android.view.animation.DecelerateInterpolator;
 
 import org.json.JSONArray;
 import org.json.JSONObject;
@@ -79,6 +81,7 @@ public class BranchCanvasView extends View {
     private boolean imagesScheduled, positioned, fitOnSize;
     private String selectedId = "", currentId = "";
     private float zoom = 1f, panX, panY;
+    private ValueAnimator panAnimator;
     private float downX, downY, lastX, lastY, scaleFocusX, scaleFocusY;
     private int pointerId = -1;
     private boolean moved, multiTouch;
@@ -111,6 +114,7 @@ public class BranchCanvasView extends View {
         scaleDetector = new ScaleGestureDetector(context,
                 new ScaleGestureDetector.SimpleOnScaleGestureListener() {
                     @Override public boolean onScaleBegin(ScaleGestureDetector detector) {
+                        cancelPanAnimation();
                         multiTouch = true;
                         scaleFocusX = detector.getFocusX();
                         scaleFocusY = detector.getFocusY();
@@ -135,6 +139,7 @@ public class BranchCanvasView extends View {
     }
 
     public void setStory(JSONObject story) {
+        cancelPanAnimation();
         imageGeneration++;
         if (decoder != null) decoder.getQueue().clear();
         pendingImages.clear();
@@ -286,6 +291,7 @@ public class BranchCanvasView extends View {
     public String selectedNodeId() { return selectedId; }
 
     public void zoomBy(float factor) {
+        cancelPanAnimation();
         if (!Float.isFinite(factor) || factor <= 0) return;
         float x = getWidth() / 2f, y = contentCenterY();
         float worldX = (x - panX) / scale(), worldY = (y - panY) / scale();
@@ -299,12 +305,13 @@ public class BranchCanvasView extends View {
         Node node = byId.get(currentId);
         if (node == null) node = byId.get(selectedId);
         if (node == null) return;
-        if (!node.id.equals(selectedId)) select(node, false);
+        if (!node.id.equals(selectedId)) select(node, false, false);
         zoom = 1f;
         centerOn(node);
     }
 
     public void fitAll() {
+        cancelPanAnimation();
         if (nodes.isEmpty()) return;
         if (getWidth() == 0 || getHeight() == 0) { fitOnSize = true; return; }
         float width = Math.max(1, getWidth() - 48 * density);
@@ -320,15 +327,40 @@ public class BranchCanvasView extends View {
     private float clampZoom(float value) { return Math.max(MIN_ZOOM, Math.min(MAX_ZOOM, value)); }
     private float contentCenterY() { return (getHeight() - 24 * density) / 2f; }
 
+    private void cancelPanAnimation() {
+        if (panAnimator != null) {
+            panAnimator.cancel();
+            panAnimator = null;
+        }
+    }
+
     private void centerOn(Node node) {
+        cancelPanAnimation();
         if (getWidth() == 0 || getHeight() == 0) return;
-        panX = getWidth() / 2f - (node.x + CARD_W / 2) * scale();
-        panY = contentCenterY() - (node.y + CARD_H / 2) * scale();
+        float targetX = getWidth() / 2f - (node.x + CARD_W / 2) * scale();
+        float targetY = contentCenterY() - (node.y + CARD_H / 2) * scale();
+        if (positioned) {
+            float startX = panX, startY = panY;
+            panAnimator = ValueAnimator.ofFloat(0f, 1f);
+            panAnimator.setDuration(180);
+            panAnimator.setInterpolator(new DecelerateInterpolator());
+            panAnimator.addUpdateListener(animation -> {
+                float fraction = (float) animation.getAnimatedValue();
+                panX = startX + (targetX - startX) * fraction;
+                panY = startY + (targetY - startY) * fraction;
+                invalidate();
+            });
+            panAnimator.start();
+        } else {
+            panX = targetX;
+            panY = targetY;
+        }
         positioned = true;
         invalidate();
     }
 
     @Override protected void onSizeChanged(int w, int h, int oldw, int oldh) {
+        cancelPanAnimation();
         super.onSizeChanged(w, h, oldw, oldh);
         if (fitOnSize) { fitOnSize = false; fitAll(); }
         else if (!positioned) focusCurrent();
@@ -531,6 +563,7 @@ public class BranchCanvasView extends View {
         scaleDetector.onTouchEvent(event);
         switch (event.getActionMasked()) {
             case MotionEvent.ACTION_DOWN:
+                cancelPanAnimation();
                 requestFocus();
                 if (getParent() != null) getParent().requestDisallowInterceptTouchEvent(true);
                 pointerId = event.getPointerId(0);
@@ -593,18 +626,21 @@ public class BranchCanvasView extends View {
             Node node = nodes.get(i);
             if (x >= node.x && x <= node.x + CARD_W && y >= node.y && y <= node.y + CARD_H) {
                 if (node.id.equals(selectedId)) performClick();
-                else { super.performClick(); select(node, true); }
+                else { super.performClick(); select(node, true, true); }
                 return;
             }
         }
     }
 
-    private void select(Node node, boolean announce) {
+    private void select(Node node, boolean announce, boolean preservePosition) {
+        cancelPanAnimation();
         float oldX = node.x, oldY = node.y;
         selectedId = node.id;
         layoutTree();
-        panX += (oldX - node.x) * scale();
-        panY += (oldY - node.y) * scale();
+        if (preservePosition) {
+            panX += (oldX - node.x) * scale();
+            panY += (oldY - node.y) * scale();
+        }
         updateDescription();
         if (announce) announceForAccessibility("已选中 " + node.title + "，再次点击打开");
         invalidate();
@@ -628,7 +664,7 @@ public class BranchCanvasView extends View {
             if (score < best) { best = score; nearest = node; }
         }
         if (nearest == null) return false;
-        select(nearest, true);
+        select(nearest, true, false);
         centerOn(nearest);
         return true;
     }
@@ -674,7 +710,7 @@ public class BranchCanvasView extends View {
             Node selected = byId.get(selectedId);
             int index = nodes.indexOf(selected) + (action == AccessibilityNodeInfo.ACTION_SCROLL_FORWARD ? 1 : -1);
             if (index >= 0 && index < nodes.size()) {
-                select(nodes.get(index), true);
+                select(nodes.get(index), true, false);
                 centerOn(nodes.get(index));
                 return true;
             }
@@ -764,6 +800,7 @@ public class BranchCanvasView extends View {
     }
 
     @Override protected void onDetachedFromWindow() {
+        cancelPanAnimation();
         detached = true;
         imageGeneration++;
         if (decoder != null) decoder.shutdownNow();
