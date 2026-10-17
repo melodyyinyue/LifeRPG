@@ -1,0 +1,10 @@
+plugins {
+    id 'com.android.application' version '8.7.3' apply false
+}
+
+// 可将构建中间产物放到工程目录之外，默认仍兼容 Android Studio。
+allprojects {
+    if (rootProject.hasProperty('outputRoot')) {
+        layout.buildDirectory.set(new File(rootProject.property('outputRoot').toString(), project.name))
+    }
+}
