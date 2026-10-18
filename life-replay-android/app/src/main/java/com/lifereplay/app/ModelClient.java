@@ -1,7 +1,5 @@
 package com.lifereplay.app;
 
-import android.graphics.Bitmap;
-import android.graphics.BitmapFactory;
 import android.util.Base64;
 import android.util.JsonReader;
 import android.util.JsonToken;
@@ -33,14 +31,12 @@ import javax.net.ssl.HttpsURLConnection;
 /** 可选的兼容协议传输层；这些协议并不代表已经验证 MP 兼容性。 */
 public class ModelClient {
     public static class Config {
-        public String textUrl = "";
-        public String imageUrl = "";
+        public String textUrl = "https://api.stepfun.com/v1/chat/completions";
         public String audioUrl = "https://api.stepfun.com/v1/audio/generate";
         public String asrUrl = "https://api.stepfun.com/v1/audio/asr/sse";
         public String key = "";
         public String audioKey = "";
-        public String textModel = "step-5-preview:stepfun";
-        public String imageModel = "gpt-image-2";
+        public String textModel = "step-3.5-flash";
         public String audioModel = "stepaudio-3-gen-preview";
         public String asrModel = "stepaudio-3-asr-max";
     }
@@ -50,9 +46,6 @@ public class ModelClient {
     }
 
     private static final int TEXT_LIMIT = 2 * 1024 * 1024;
-    private static final int IMAGE_LIMIT = 20 * 1024 * 1024;
-    // 为 20MB 图片的 Base64 及 JSON 包装预留空间，不放宽文本和 SSE 上限。
-    private static final int IMAGE_JSON_LIMIT = 28 * 1024 * 1024;
     private static final int AUDIO_LIMIT = 20 * 1024 * 1024;
     private static final int PCM_LIMIT = 2 * 1024 * 1024;
     private static final String INSTRUCTION =
@@ -71,17 +64,64 @@ public class ModelClient {
             throw new IllegalArgumentException("缺少模型配置");
         }
         this.config = new Config();
-        this.config.textUrl = config.textUrl;
-        this.config.imageUrl = config.imageUrl;
+        this.config.textUrl = normalizeEndpoint(config.textUrl);
         this.config.audioUrl = config.audioUrl;
         this.config.asrUrl = config.asrUrl;
         this.config.key = config.key;
         this.config.audioKey = config.audioKey;
         this.config.textModel = config.textModel;
-        this.config.imageModel = config.imageModel;
         this.config.audioModel = config.audioModel;
         this.config.asrModel = config.asrModel;
         this.trace = trace;
+    }
+
+    /** 将标准 OpenAI Base URL 转成端点；已有完整端点及自定义路由不改写。 */
+    public static String normalizeEndpoint(String value) {
+        String input = value == null ? "" : value.trim();
+        if (input.isEmpty()) {
+            return new Config().textUrl;
+        }
+        try {
+            URI uri = endpointUri(input);
+            String path = uri.getRawPath();
+            while (path.endsWith("/")) {
+                path = path.substring(0, path.length() - 1);
+            }
+            String suffix = "/chat/completions";
+            if (path.isEmpty()) {
+                path = "/v1" + suffix;
+            } else if (path.endsWith("/v1")) {
+                path += suffix;
+            } else if (!path.endsWith(suffix)) {
+                return input;
+            }
+            return uri.getScheme() + "://" + uri.getRawAuthority() + path
+                    + (uri.getRawQuery() == null ? "" : "?" + uri.getRawQuery());
+        } catch (Exception ignored) {
+            // 不修复不安全输入；请求时仍由同一 HTTPS 校验拒绝，且不回显地址。
+            return input;
+        }
+    }
+
+    private static URI endpointUri(String input) throws Exception {
+        URI uri = new URI(input == null ? "" : input.trim());
+        if (!"https".equalsIgnoreCase(uri.getScheme()) || uri.getHost() == null
+                || uri.getHost().isEmpty() || uri.getRawUserInfo() != null
+                || uri.getRawFragment() != null || uri.getPort() == 0
+                || uri.getPort() < -1 || uri.getPort() > 65535) {
+            throw new IllegalArgumentException("端点必须是无用户凭据及片段的完整 HTTPS URL");
+        }
+        return uri;
+    }
+
+    public static boolean isOfficialTextEndpoint(String input) {
+        try {
+            URI uri = endpointUri(input);
+            return "api.stepfun.com".equalsIgnoreCase(uri.getHost())
+                    && (uri.getPort() == -1 || uri.getPort() == 443);
+        } catch (Exception ignored) {
+            return false;
+        }
     }
 
     public JSONObject chat(String system, String user) throws Exception {
@@ -89,22 +129,50 @@ public class ModelClient {
             if (system == null || user == null) {
                 throw failure(call, "缺少对话内容");
             }
+            boolean official = isOfficialTextEndpoint(config.textUrl);
             JSONObject request = new JSONObject()
                     .put("model", requireModel(call, config.textModel))
                     .put("messages", new JSONArray()
-                            .put(new JSONObject().put("role", "system").put("content", system))
+                            .put(new JSONObject().put("role", "system").put("content", official
+                                    ? system + "\n只输出一个完整的 JSON 对象，遵守上述格式示例。" : system))
                             .put(new JSONObject().put("role", "user").put("content", user)))
                     .put("stream", false);
-            return post(call, config.textUrl, config.key, request, "application/json", connection -> {
+            if (official) {
+                request.put("response_format", new JSONObject().put("type", "json_object"))
+                        .put("max_tokens", 8192);
+            }
+            return post(call, config.textUrl, official ? audioKey(call) : config.key,
+                    request, "application/json", connection -> {
                 JSONObject response = readJson(call, connection);
                 observeModel(call, response);
                 JSONArray choices = response.optJSONArray("choices");
                 JSONObject choice = choices == null ? null : choices.optJSONObject(0);
-                JSONObject message = choice == null ? null : choice.optJSONObject("message");
-                if (message == null || !(message.opt("content") instanceof String)) {
-                    throw failure(call, "未知文本响应格式，缺少 message.content 字符串");
+                if (choice == null) {
+                    throw failure(call, "文本响应缺少 choices[0]，请检查模型是否支持 Chat Completions");
                 }
-                String content = ((String) message.get("content")).trim();
+                Object finishReason = choice.opt("finish_reason");
+                if ("length".equals(finishReason)) {
+                    throw failure(call, "模型输出达到长度限制，故事不完整；请缩短输入或减少生成内容后重试");
+                }
+                if ("content_filter".equals(finishReason) || "refusal".equals(finishReason)) {
+                    throw failure(call, "模型拒绝生成或内容被过滤，请调整输入后重试");
+                }
+                if (finishReason != null && finishReason != JSONObject.NULL
+                        && !"stop".equals(finishReason)) {
+                    throw failure(call, "模型未正常结束文本生成（可能请求了工具调用），未生成完整故事");
+                }
+                JSONObject message = choice.optJSONObject("message");
+                if (message == null) {
+                    throw failure(call, "未知文本响应格式，缺少 message 对象");
+                }
+                Object refusal = message.opt("refusal");
+                if (refusal != null && refusal != JSONObject.NULL && !"".equals(refusal)) {
+                    throw failure(call, "模型拒绝生成，请调整输入后重试");
+                }
+                String content = chatContent(call, message.opt("content")).trim();
+                if (content.isEmpty()) {
+                    throw failure(call, "模型返回空文本，未生成故事");
+                }
                 // 仅接受完整的外层 JSON 代码块，绝不从任意文本中截取内部对象。
                 if (content.startsWith("```")) {
                     int lineEnd = content.indexOf('\n');
@@ -123,44 +191,28 @@ public class ModelClient {
         });
     }
 
-    public byte[] image(String prompt) throws Exception {
-        return perform("image", config.imageModel, call -> {
-            if (prompt == null || prompt.trim().isEmpty()) {
-                throw failure(call, "缺少图片提示词");
+    private String chatContent(Call call, Object content) throws SafeFailure {
+        if (content instanceof String) {
+            return (String) content;
+        }
+        if (!(content instanceof JSONArray)) {
+            throw failure(call, "未知文本响应格式，message.content 必须是字符串或文本内容数组");
+        }
+        JSONArray parts = (JSONArray) content;
+        StringBuilder text = new StringBuilder();
+        for (int i = 0; i < parts.length(); i++) {
+            JSONObject part = parts.optJSONObject(i);
+            if (part != null && "refusal".equals(part.optString("type"))) {
+                throw failure(call, "模型拒绝生成，请调整输入后重试");
             }
-            JSONObject request = new JSONObject()
-                    .put("model", requireModel(call, config.imageModel))
-                    .put("prompt", prompt).put("n", 1);
-            JSONObject response = post(call, config.imageUrl, config.key, request,
-                    "application/json", connection -> readJson(call, connection, IMAGE_JSON_LIMIT));
-            observeModel(call, response);
-            JSONArray data = response.optJSONArray("data");
-            JSONObject first = data == null ? null : data.optJSONObject(0);
-            if (first == null) {
-                throw failure(call, "未知图片响应格式，缺少 data[0]");
+            if (part == null || !("text".equals(part.optString("type"))
+                    || "output_text".equals(part.optString("type")))
+                    || !(part.opt("text") instanceof String)) {
+                throw failure(call, "文本内容数组包含不支持的内容，无法确认完整故事");
             }
-            byte[] bytes;
-            Object encoded = first.opt("b64_json");
-            Object url = first.opt("url");
-            if (encoded instanceof String && !((String) encoded).isEmpty()) {
-                String base64 = (String) encoded;
-                if (base64.length() > ((long) IMAGE_LIMIT + 2) / 3 * 4 + 1024) {
-                    throw failure(call, "图片超过大小限制");
-                }
-                try {
-                    bytes = Base64.decode(base64, Base64.DEFAULT);
-                } catch (IllegalArgumentException ignored) {
-                    throw failure(call, "图片 Base64 格式无效");
-                }
-            } else if (url instanceof String && !((String) url).isEmpty()) {
-                // 下载属于同一次图片操作，不计为第二次模型调用。
-                bytes = downloadImage(call, (String) url);
-            } else {
-                throw failure(call, "未知图片响应格式，需要 b64_json 或 HTTPS url");
-            }
-            verifyImage(call, bytes);
-            return bytes;
-        });
+            text.append((String) part.opt("text"));
+        }
+        return text.toString();
     }
 
     public byte[] speak(JSONArray roles, JSONArray scripts) throws Exception {
@@ -231,7 +283,7 @@ public class ModelClient {
 
     private String audioKey(Call call) throws SafeFailure {
         if (config.audioKey == null || config.audioKey.trim().isEmpty()) {
-            throw failure(call, "请填写 Step / 语音专用 Key");
+            throw failure(call, "缺少 Step Key，请在设置中填写 Step Key（文本 / 配音 / 识别共用）；不会使用代理 Key 替代");
         }
         return config.audioKey;
     }
@@ -298,10 +350,10 @@ public class ModelClient {
             return result;
         } catch (SafeFailure error) {
             throw error;
-        } catch (Exception ignored) {
-            // 不透传通信、解析或回调异常，避免泄露密钥和响应正文。
+        } catch (Exception error) {
+            // 仅按异常类型分类，不透传异常原文、地址或响应正文。
             checkCancelled(call);
-            throw failure(call, "网络通信或响应处理失败");
+            throw failure(call, safeError(error));
         } finally {
             if (call.attempted && trace != null) {
                 long millis = Math.max(0L, (System.nanoTime() - call.startedNanos) / 1_000_000L);
@@ -344,33 +396,12 @@ public class ModelClient {
         }
     }
 
-    private byte[] downloadImage(Call call, String url) throws Exception {
-        HttpsURLConnection connection = open(call, url);
-        try {
-            connection.setRequestMethod("GET");
-            connection.setRequestProperty("Accept", "image/*, application/octet-stream");
-            // 不携带 Authorization，也不允许任何重定向，包括跨域重定向。
-            checkStatus(call, connection);
-            return readBody(call, connection, IMAGE_LIMIT);
-        } finally {
-            close(connection);
-        }
-    }
-
     private HttpsURLConnection open(Call call, String input) throws Exception {
         URI uri;
         try {
-            uri = new URI(input == null ? "" : input.trim());
-            if (!"https".equalsIgnoreCase(uri.getScheme()) || uri.getHost() == null
-                    || uri.getHost().isEmpty() || uri.getRawUserInfo() != null
-                    || uri.getRawFragment() != null || uri.getPort() == 0
-                    || uri.getPort() < -1 || uri.getPort() > 65535) {
-                throw failure(call, "端点必须是无用户凭据及片段的完整 HTTPS URL");
-            }
-        } catch (SafeFailure error) {
-            throw error;
+            uri = endpointUri(input);
         } catch (Exception ignored) {
-            throw failure(call, "端点必须是有效的完整 HTTPS URL");
+            throw failure(call, "端点必须是有效、无用户凭据及片段的完整 HTTPS URL");
         }
         checkCancelled(call);
         HttpsURLConnection connection = (HttpsURLConnection) uri.toURL().openConnection();
@@ -405,7 +436,23 @@ public class ModelClient {
         checkCancelled(call);
         if (code < 200 || code >= 300) {
             // 不读取错误正文、原因短语、URL、Location 或凭据。
-            throw failure(call, "HTTP " + code + (code >= 300 && code < 400 ? "（不允许重定向）" : ""));
+            String diagnosis;
+            if (code == 401) {
+                diagnosis = "鉴权失败，请检查该服务的 API Key 是否有效";
+            } else if (code == 403) {
+                diagnosis = "鉴权或访问权限不足，请检查 Key 的模型权限及服务访问策略";
+            } else if (code == 404) {
+                diagnosis = "路由或模型不存在，请检查 Base URL、完整端点与模型名称";
+            } else if (code == 429) {
+                diagnosis = "请求限流或额度不足，请稍后重试并检查配额";
+            } else if (code >= 500 && code < 600) {
+                diagnosis = "上游服务异常，请稍后重试或联系服务提供方";
+            } else if (code >= 300 && code < 400) {
+                diagnosis = "不允许重定向，请填写最终 HTTPS 端点";
+            } else {
+                diagnosis = "服务拒绝请求，请检查端点、模型及请求参数";
+            }
+            throw failure(call, "HTTP_" + code + " · HTTP " + code + "（" + diagnosis + "）");
         }
         String encoding = connection.getContentEncoding();
         if (encoding != null && !encoding.trim().isEmpty()
@@ -420,15 +467,49 @@ public class ModelClient {
 
     private JSONObject readJson(Call call, HttpsURLConnection connection, int limit) throws Exception {
         byte[] bytes = readBody(call, connection, limit);
-        String json = StandardCharsets.UTF_8.newDecoder()
-                .onMalformedInput(CodingErrorAction.REPORT)
-                .onUnmappableCharacter(CodingErrorAction.REPORT)
-                .decode(ByteBuffer.wrap(bytes)).toString();
+        if (!looksLikeJson(bytes)) {
+            throw failure(call, "服务返回空响应或非 JSON 内容（可能是网关页面），请检查端点和服务状态");
+        }
+        String json;
+        try {
+            json = StandardCharsets.UTF_8.newDecoder()
+                    .onMalformedInput(CodingErrorAction.REPORT)
+                    .onUnmappableCharacter(CodingErrorAction.REPORT)
+                    .decode(ByteBuffer.wrap(bytes)).toString();
+        } catch (java.nio.charset.CharacterCodingException ignored) {
+            throw failure(call, "JSON 响应不是有效 UTF-8，请检查服务协议");
+        }
         JSONObject object = parseObject(call, json, limit);
         if (object.has("error") && !object.isNull("error")) {
-            throw failure(call, "服务返回错误对象");
+            throw failure(call, responseError(object.optJSONObject("error")));
         }
         return object;
+    }
+
+    private static String responseError(JSONObject error) {
+        if (error != null) {
+            for (String field : new String[] {"code", "type"}) {
+                Object value = error.opt(field);
+                if (!(value instanceof String)) continue;
+                switch (((String) value).toLowerCase(Locale.ROOT)) {
+                    case "invalid_api_key":
+                    case "authentication_error":
+                    case "unauthorized":
+                    case "permission_denied":
+                        return "RESPONSE_AUTH · 响应错误：鉴权或权限不足，请检查 Key 及模型授权";
+                    case "rate_limit_exceeded":
+                    case "rate_limit_error":
+                    case "insufficient_quota":
+                        return "RESPONSE_RATE_LIMIT · 响应错误：限流或额度不足，请检查配额并稍后重试";
+                    case "model_not_found":
+                    case "invalid_model":
+                        return "RESPONSE_MODEL_NOT_FOUND · 响应错误：模型不存在或不可用，请检查模型名称与权限";
+                    default:
+                        break;
+                }
+            }
+        }
+        return "RESPONSE_ERROR · 服务返回错误对象，请检查端点、模型及服务状态";
     }
 
     private JSONObject parseObject(Call call, String text) throws Exception {
@@ -674,32 +755,6 @@ public class ModelClient {
         return null;
     }
 
-    private void verifyImage(Call call, byte[] bytes) throws SafeFailure {
-        checkCancelled(call);
-        if (bytes.length == 0 || bytes.length > IMAGE_LIMIT) {
-            throw failure(call, "图片为空或超过 20MB");
-        }
-        BitmapFactory.Options bounds = new BitmapFactory.Options();
-        bounds.inJustDecodeBounds = true;
-        BitmapFactory.decodeByteArray(bytes, 0, bytes.length, bounds);
-        long pixels = (long) bounds.outWidth * bounds.outHeight;
-        if (bounds.outWidth <= 0 || bounds.outHeight <= 0 || bounds.outWidth > 16384
-                || bounds.outHeight > 16384 || pixels > 64L * 1024 * 1024) {
-            throw failure(call, "图片无法解码或像素尺寸超出安全限制");
-        }
-        BitmapFactory.Options options = new BitmapFactory.Options();
-        options.inSampleSize = 1;
-        while (pixels / ((long) options.inSampleSize * options.inSampleSize) > 1024 * 1024) {
-            options.inSampleSize *= 2;
-        }
-        Bitmap bitmap = BitmapFactory.decodeByteArray(bytes, 0, bytes.length, options);
-        if (bitmap == null) {
-            throw failure(call, "图片实际解码失败");
-        }
-        bitmap.recycle();
-        checkCancelled(call);
-    }
-
     private static String mediaType(HttpsURLConnection connection) {
         String type = connection.getContentType();
         if (type == null) {
@@ -789,6 +844,51 @@ public class ModelClient {
     /** 仅此客户端生成的异常可直接显示消息，不信任外层包装异常的消息。 */
     public static boolean isSafeError(Exception error) {
         return error instanceof SafeFailure;
+    }
+
+    /** 仅匹配有限深度 cause 链的类型，绝不读取普通异常消息。 */
+    public static String safeError(Exception error) {
+        if (isSafeError(error)) return error.getMessage();
+        if (hasCause(error, java.net.SocketTimeoutException.class))
+            return "NETWORK_TIMEOUT · 网络请求超时，请检查网络及服务负载；远端结果与计费可能未知";
+        if (hasCause(error, java.net.UnknownHostException.class))
+            return "DNS · 域名解析失败，请检查端点域名、设备 DNS、网络或 VPN";
+        if (hasCause(error, javax.net.ssl.SSLException.class))
+            return "TLS · 安全连接失败，请检查设备时间、服务证书及代理/VPN，勿关闭证书校验";
+        if (hasCause(error, java.net.ConnectException.class))
+            return "CONNECT · 无法连接服务，请检查网络、端口、代理/VPN及服务可达性";
+        if (hasCause(error, java.net.SocketException.class))
+            return "SOCKET_DISCONNECTED · 网络连接中断，请检查网络或代理后再决定是否重试";
+        if (hasCause(error, java.io.InterruptedIOException.class)
+                || hasCause(error, InterruptedException.class))
+            return "CANCELLED · 操作取消或中断，远端结果与计费可能未知，不会自动重试";
+        if (hasCause(error, IOException.class))
+            return "IO · 通信、响应读取或本地文件处理失败，请检查网络、服务及存储空间";
+        return "PROCESSING_ERROR · 响应处理失败，请检查模型协议、输入及设备状态";
+    }
+
+    private static boolean hasCause(Throwable error, Class<? extends Throwable> type) {
+        for (int depth = 0; error != null && depth < 8; depth++, error = error.getCause()) {
+            if (type.isInstance(error)) return true;
+        }
+        return false;
+    }
+
+    public String diagnosticTarget() {
+        String endpoint;
+        try {
+            URI uri = endpointUri(config.textUrl);
+            endpoint = uri.getHost() + (uri.getPort() < 0 ? "" : ":" + uri.getPort()) + uri.getRawPath();
+            String decoded = uri.getHost() + uri.getPath();
+            if (containsSecret(endpoint, config.key) || containsSecret(endpoint, config.audioKey)
+                    || containsSecret(decoded, config.key) || containsSecret(decoded, config.audioKey)) {
+                endpoint = "redacted";
+            }
+        } catch (Exception ignored) {
+            endpoint = "无效 HTTPS 端点（已隐藏）";
+        }
+        return "端点（host + path，不含查询参数）：" + endpoint
+                + "\n测试模型：" + safeModel(config.textModel);
     }
 
     /** 消息仅由预定义能力名、固定错误短语及 HTTP 状态码组成。 */

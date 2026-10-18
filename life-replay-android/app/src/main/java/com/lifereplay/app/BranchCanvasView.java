@@ -87,7 +87,8 @@ public class BranchCanvasView extends View {
     private boolean moved, multiTouch;
 
     private static final class Node {
-        String id, parentId, title, imageKey, imageStatus;
+        String id, parentId, title, choice, imageKey, fallbackKey, imageStatus;
+        boolean demo;
         int option, depth, level;
         float x, y;
         Node parent;
@@ -160,18 +161,23 @@ public class BranchCanvasView extends View {
                 node.id = id;
                 node.parentId = value.optString("parent", "");
                 node.title = value.optString("title", "未命名场景");
+                node.choice = value.optString("choice", "");
                 node.option = value.optInt("option", -1);
                 node.depth = Math.max(0, value.optInt("depth", 0));
                 node.imageStatus = value.optString("imageStatus", "pending");
+                node.demo = demo && !value.optBoolean("aiBranch", false);
                 String filename = value.optString("imagePath", "");
-                String art = value.optString("demoArt", "");
+                String art = ProjectLibrary.artFor(story, value);
+                node.fallbackKey = art == null ? "" : "asset:scenes/" + art + ".jpg";
                 node.imageKey = "";
                 if (!filename.isEmpty()) {
-                    node.imageKey = filename.matches("[a-fA-F0-9-]+\\.img")
-                            ? "file:" + filename : "invalid:" + id;
-                } else if (demo && (art.equals("rain_city") || art.equals("rain_archive")
-                        || art.equals("rain_rooftop") || art.equals("rain_station"))) {
-                    node.imageKey = "asset:scenes/" + art + ".jpg";
+                    if (filename.matches("[a-fA-F0-9-]+\\.img")) {
+                        File file = new File(getContext().getFilesDir(), filename);
+                        node.imageKey = "file:" + filename + "|" + file.length() + "|"
+                                + file.lastModified() + "|" + node.imageStatus;
+                    } else {
+                        node.imageKey = "invalid:" + id;
+                    }
                 }
                 JSONArray options = value.optJSONArray("options");
                 if (options != null) {
@@ -384,8 +390,16 @@ public class BranchCanvasView extends View {
         canvas.translate(panX, panY);
         canvas.scale(scale(), scale());
         for (Node node : nodes) {
-            if (node.parent != null) drawEdge(canvas, node.parent, node.x, node.y + CARD_H / 2,
-                    selectedPath.contains(node.id), false);
+            if (node.parent != null) {
+                drawEdge(canvas, node.parent, node.x, node.y + CARD_H / 2,
+                        selectedPath.contains(node.id), false);
+                if (node.option == -2 && visible(node.x - COLUMN + CARD_W, node.y + CARD_H / 2 - 22,
+                        COLUMN - CARD_W, 22)) {
+                    text(canvas, node.choice, node.x - 8, node.y + CARD_H / 2 - 8,
+                            10, selectedPath.contains(node.id) ? MINT : MUTED,
+                            false, Paint.Align.RIGHT, COLUMN - CARD_W - 16);
+                }
+            }
         }
         for (Exit exit : exits) drawEdge(canvas, exit.parent, exit.x, exit.y + 36, false, true);
         for (Node node : nodes) {
@@ -442,6 +456,8 @@ public class BranchCanvasView extends View {
         canvas.save();
         canvas.clipPath(path);
         Bitmap bitmap = node.imageKey.isEmpty() ? null : images.get(node.imageKey);
+        boolean fallback = bitmap == null;
+        if (fallback && !node.fallbackKey.isEmpty()) bitmap = images.get(node.fallbackKey);
         if (bitmap != null) {
             int width = bitmap.getWidth(), height = bitmap.getHeight();
             float ratio = CARD_W / 108f;
@@ -455,6 +471,12 @@ public class BranchCanvasView extends View {
             canvas.drawBitmap(bitmap, sourceRect, rect, paint);
             fill(0x14050917);
             canvas.drawRect(rect, paint);
+            if (fallback && !node.demo) {
+                fill(0xd9101829);
+                canvas.drawRect(node.x, node.y + 86, node.x + CARD_W, node.y + 108, paint);
+                text(canvas, "内置插画 · 非本次生成", node.x + 12, node.y + 101,
+                        10, TEXT, false, Paint.Align.LEFT, CARD_W - 24);
+            }
         } else {
             fill(0xff111a2d);
             canvas.drawRect(node.x, node.y, node.x + CARD_W, node.y + 108, paint);
@@ -736,7 +758,8 @@ public class BranchCanvasView extends View {
             updateViewport();
             List<Node> visibleNodes = new ArrayList<>();
             for (Node node : nodes) {
-                if (!node.imageKey.isEmpty() && visible(node.x, node.y, CARD_W, CARD_H)) visibleNodes.add(node);
+                if ((!node.imageKey.isEmpty() || !node.fallbackKey.isEmpty())
+                        && visible(node.x, node.y, CARD_W, CARD_H)) visibleNodes.add(node);
             }
             visibleNodes.sort(Comparator.comparingDouble(node -> node.id.equals(selectedId) ? -1
                     : Math.hypot(node.x + CARD_W / 2 - viewport.centerX(), node.y + CARD_H / 2 - viewport.centerY())));
@@ -744,8 +767,9 @@ public class BranchCanvasView extends View {
             Set<String> wanted = new HashSet<>();
             for (Node node : visibleNodes) {
                 if (wanted.size() >= 24) break;
-                String key = node.imageKey;
-                if (!wanted.add(key) || images.get(key) != null || failedImages.contains(key)
+                String key = node.imageKey.isEmpty() || node.imageKey.startsWith("invalid:")
+                        || failedImages.contains(node.imageKey) ? node.fallbackKey : node.imageKey;
+                if (key.isEmpty() || !wanted.add(key) || images.get(key) != null || failedImages.contains(key)
                         || pendingImages.contains(key)) continue;
                 if (pendingImages.size() >= 32) break;
                 pendingImages.add(key);
@@ -755,14 +779,20 @@ public class BranchCanvasView extends View {
                     try { bitmap = decodeImage(key); }
                     catch (IOException | RuntimeException | OutOfMemoryError ignored) { }
                     final Bitmap decoded = bitmap;
-                    if (detached || Thread.currentThread().isInterrupted()) return;
-                    handler.post(() -> {
-                        if (detached || generation != imageGeneration) return;
+                    if (detached || Thread.currentThread().isInterrupted()) {
+                        if (decoded != null) decoded.recycle();
+                        return;
+                    }
+                    if (!handler.post(() -> {
+                        if (detached || generation != imageGeneration) {
+                            if (decoded != null) decoded.recycle();
+                            return;
+                        }
                         pendingImages.remove(key);
                         if (decoded == null) failedImages.add(key);
                         else images.put(key, decoded);
                         invalidate();
-                    });
+                    }) && decoded != null) decoded.recycle();
                 });
             }
         });
@@ -772,7 +802,7 @@ public class BranchCanvasView extends View {
         if (key.startsWith("asset:")) return getContext().getAssets().open(key.substring(6));
         if (!key.startsWith("file:")) throw new IOException("Invalid image reference");
         File root = getContext().getFilesDir().getCanonicalFile();
-        File file = new File(root, key.substring(5)).getCanonicalFile();
+        File file = new File(root, key.substring(5, key.indexOf('|'))).getCanonicalFile();
         if (!root.equals(file.getParentFile())) throw new IOException("Invalid image location");
         return new FileInputStream(file);
     }
@@ -804,7 +834,7 @@ public class BranchCanvasView extends View {
         detached = true;
         imageGeneration++;
         if (decoder != null) decoder.shutdownNow();
-        handler.removeCallbacksAndMessages(null);
+        // Let queued decode results release unpublished bitmaps after the generation check.
         imagesScheduled = false;
         pendingImages.clear();
         failedImages.clear();

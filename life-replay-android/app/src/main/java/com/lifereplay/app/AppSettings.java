@@ -22,6 +22,7 @@ public class AppSettings {
     private static final String ALIAS = "com.lifereplay.app.settings.aes.v1";
     private static final String KEY = "key.encrypted";
     private static final String AUDIO_KEY = "audioKey.encrypted";
+    private static final String TEXT_MIGRATED = "text.step35.migrated";
     private static final int IV_LENGTH = 12;
     private final SharedPreferences preferences;
 
@@ -34,8 +35,10 @@ public class AppSettings {
         synchronized (LOCK) {
             try {
                 ModelClient.Config config = new ModelClient.Config();
-                config.textUrl = preferences.getString("textUrl", "");
-                config.imageUrl = preferences.getString("imageUrl", "");
+                String textUrl = value(preferences.getString("textUrl", ""));
+                if (!textUrl.trim().isEmpty()) {
+                    config.textUrl = ModelClient.normalizeEndpoint(textUrl);
+                }
                 String audioUrl = value(preferences.getString("audioUrl", ""));
                 String asrUrl = value(preferences.getString("asrUrl", ""));
                 if (!audioUrl.trim().isEmpty()) {
@@ -45,16 +48,52 @@ public class AppSettings {
                     config.asrUrl = asrUrl;
                 }
                 config.textModel = preferences.getString("textModel", config.textModel);
-                config.imageModel = preferences.getString("imageModel", config.imageModel);
                 config.audioModel = preferences.getString("audioModel", config.audioModel);
                 config.asrModel = preferences.getString("asrModel", config.asrModel);
                 config.key = decrypt(KEY);
                 config.audioKey = decrypt(AUDIO_KEY);
+                migrateTextConfig(config);
                 return config;
             } catch (Exception ignored) {
                 // 配置损坏时不返回默认配置，错误消息中不包含服务商或偏好设置的值。
                 throw new Exception("读取配置失败，配置或加密密钥不可用；请明确重设或清除配置");
             }
+        }
+    }
+
+    private void migrateTextConfig(ModelClient.Config config) throws Exception {
+        if (preferences.getBoolean(TEXT_MIGRATED, false)) return;
+        ModelClient.Config defaults = new ModelClient.Config();
+        String savedUrl = value(preferences.getString("textUrl", "")).trim();
+        boolean legacyRoute = false;
+        try {
+            java.net.URI uri = new java.net.URI(config.textUrl);
+            legacyRoute = "https".equalsIgnoreCase(uri.getScheme())
+                    && "models-proxy.stepfun-inc.com".equalsIgnoreCase(uri.getHost())
+                    && (uri.getPort() == -1 || uri.getPort() == 443)
+                    && uri.getRawUserInfo() == null && uri.getRawQuery() == null
+                    && uri.getRawFragment() == null
+                    && "/v1/chat/completions".equals(uri.getRawPath());
+        } catch (Exception ignored) {
+            // 自定义或无效路由保留，不能将凭据迁往未确认的服务。
+        }
+        boolean defaultRoute = savedUrl.isEmpty() || legacyRoute;
+        boolean oldOfficialModel = ModelClient.isOfficialTextEndpoint(config.textUrl)
+                && (value(config.textModel).trim().isEmpty()
+                || "step-5-preview:stepfun".equals(config.textModel)
+                || "step-5-preview".equals(config.textModel));
+        SharedPreferences.Editor editor = preferences.edit();
+        if (defaultRoute) {
+            config.textUrl = defaults.textUrl;
+            editor.putString("textUrl", config.textUrl);
+        }
+        if (defaultRoute || oldOfficialModel) {
+            config.textModel = defaults.textModel;
+            editor.putString("textModel", config.textModel);
+        }
+        // 只更新文本配置与标记，不重写已有密文或其他能力配置。
+        if (!editor.putBoolean(TEXT_MIGRATED, true).commit()) {
+            throw new IllegalStateException();
         }
     }
 
@@ -68,12 +107,11 @@ public class AppSettings {
                 String encryptedAudioKey = encrypt(value(config.audioKey), AUDIO_KEY);
                 // 先完成全部加密，再一次性提交完整的偏好设置快照。
                 SharedPreferences.Editor editor = preferences.edit().clear()
-                        .putString("textUrl", value(config.textUrl))
-                        .putString("imageUrl", value(config.imageUrl))
+                        .putBoolean(TEXT_MIGRATED, true)
+                        .putString("textUrl", ModelClient.normalizeEndpoint(config.textUrl))
                         .putString("audioUrl", value(config.audioUrl))
                         .putString("asrUrl", value(config.asrUrl))
                         .putString("textModel", value(config.textModel))
-                        .putString("imageModel", value(config.imageModel))
                         .putString("audioModel", value(config.audioModel))
                         .putString("asrModel", value(config.asrModel));
                 if (!encryptedKey.isEmpty()) {

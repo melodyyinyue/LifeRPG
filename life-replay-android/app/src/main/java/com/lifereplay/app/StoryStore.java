@@ -216,8 +216,45 @@ public class StoryStore {
         return null;
     }
 
+    public static JSONObject existingCustomChild(JSONObject story, String parentId, String action)
+            throws JSONException {
+        validateStory(story);
+        String choice = customAction(action);
+        JSONObject parent = node(story, parentId);
+        if ("ending".equals(parent.getString("scene_type"))) {
+            throw new JSONException("结局节点不能继续自由行动");
+        }
+        JSONArray nodes = array(story, "nodes");
+        for (int i = 0; i < nodes.length(); i++) {
+            JSONObject candidate = objectAt(nodes, i);
+            if (parentId.equals(candidate.getString("parent"))
+                    && integer(candidate, "option") == -2
+                    && choice.equals(candidate.getString("customAction"))) {
+                return candidate;
+            }
+        }
+        return null;
+    }
+
+    static String customAction(String action) throws JSONException {
+        if (action == null || action.trim().isEmpty() || action.trim().length() > 500) {
+            throw new JSONException("自由行动须为 1 至 500 字符");
+        }
+        return action.trim();
+    }
+
+    public static JSONObject commitCustom(JSONObject story, String parentId, String action,
+                                          String reason, JSONObject raw) throws JSONException {
+        return commitNode(story, parentId, -2, customAction(action), reason, raw);
+    }
+
     public static JSONObject commit(JSONObject story, String parentId, int option,
                                     String reason, JSONObject raw) throws JSONException {
+        return commitNode(story, parentId, option, null, reason, raw);
+    }
+
+    private static JSONObject commitNode(JSONObject story, String parentId, int option,
+                                         String action, String reason, JSONObject raw) throws JSONException {
         validateStory(story);
         String parentKey = parentId == null ? "" : parentId;
         JSONArray nodes = array(story, "nodes");
@@ -232,13 +269,19 @@ public class StoryStore {
         } else {
             parent = node(story, parentKey);
             exploration = exploration || bool(parent, "exploration");
-            checkOption(parent, option);
-            JSONObject existing = existingChild(story, parentKey, option);
+            JSONObject existing;
+            if (action != null) {
+                existing = existingCustomChild(story, parentKey, action);
+                choice = action;
+            } else {
+                checkOption(parent, option);
+                existing = existingChild(story, parentKey, option);
+                choice = array(parent, "options").getString(option);
+            }
             if (existing != null) {
                 goTo(story, existing.getString("id"));
                 return existing;
             }
-            choice = array(parent, "options").getString(option);
             int parentDepth = integer(parent, "depth");
             if (parentDepth == Integer.MAX_VALUE) {
                 throw new JSONException("故事深度超过限制");
@@ -259,8 +302,18 @@ public class StoryStore {
         if (revision == Integer.MAX_VALUE) {
             throw new JSONException("故事版本超过限制");
         }
+        if (nodes.length() >= 1000) {
+            throw new JSONException("故事节点已达安全容量上限（1000），不能继续新增");
+        }
         JSONObject next = validateNode(raw);
-        boolean demo = bool(story, "demo");
+        boolean aiBranch = action != null || parent != null && parent.optBoolean("aiBranch", false);
+        boolean demo = bool(story, "demo") && !aiBranch;
+        if (aiBranch) {
+            next.put("aiBranch", true);
+        }
+        if (action != null) {
+            next.put("customAction", action);
+        }
         next.put("id", UUID.randomUUID().toString()).put("parent", parentKey)
                 .put("option", option).put("choice", choice).put("reason", actualReason)
                 .put("exploration", exploration).put("depth", depth)
@@ -276,6 +329,13 @@ public class StoryStore {
         }
         updated.put(next);
         JSONObject review = staleReview(story);
+        JSONObject snapshot = parse(story.toString());
+        snapshot.put("nodes", new JSONArray(updated.toString()))
+                .put("current", next.getString("id")).put("revision", revision + 1);
+        if (review != null) {
+            snapshot.put("review", review);
+        }
+        validateStory(snapshot);
         // 所有校验和可能失败的构造都在修改调用方快照之前完成。
         story.put("nodes", updated);
         story.put("current", next.getString("id"));
@@ -399,13 +459,22 @@ public class StoryStore {
             String choice = string(entry, "choice", Integer.MAX_VALUE, true);
             string(entry, "reason", 2000, true);
             bool(entry, "exploration");
+            boolean aiBranch = entry.has("aiBranch") && bool(entry, "aiBranch");
+            if (option == -2) {
+                String action = string(entry, "customAction", 500, false);
+                if (!action.equals(customAction(action)) || !choice.equals(action) || !aiBranch) {
+                    throw new JSONException("自由行动节点元数据无效");
+                }
+            } else if (entry.has("customAction")) {
+                throw new JSONException("普通节点不得包含自由行动字段");
+            }
             string(entry, "imageStatus", Integer.MAX_VALUE, false);
             string(entry, "audioStatus", Integer.MAX_VALUE, false);
             string(entry, "imagePath", Integer.MAX_VALUE, true);
             string(entry, "audioPath", Integer.MAX_VALUE, true);
             if (parentId.isEmpty()) {
                 roots++;
-                if (option != -1 || depth != 0 || !choice.isEmpty()) {
+                if (option != -1 || depth != 0 || !choice.isEmpty() || aiBranch) {
                     throw new JSONException("根节点元数据无效");
                 }
             } else {
@@ -413,10 +482,21 @@ public class StoryStore {
                 if (parent == null || parentId.equals(entry.getString("id"))) {
                     throw new JSONException("父节点无效");
                 }
-                checkOption(parent, option);
+                String edge = parentId + ":" + option;
+                if (option == -2) {
+                    if ("ending".equals(parent.getString("scene_type"))) {
+                        throw new JSONException("结局节点不能继续自由行动");
+                    }
+                    edge += ":" + choice;
+                } else {
+                    checkOption(parent, option);
+                    if (!choice.equals(array(parent, "options").getString(option))
+                            || aiBranch != parent.optBoolean("aiBranch", false)) {
+                        throw new JSONException("普通选项或 AI 分支继承无效");
+                    }
+                }
                 if (depth < 1 || (long) integer(parent, "depth") + 1 != depth
-                        || !choice.equals(array(parent, "options").getString(option))
-                        || !edges.add(parentId + ":" + option)) {
+                        || !edges.add(edge)) {
                     throw new JSONException("父子关系、选项或深度无效");
                 }
             }

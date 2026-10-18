@@ -13,6 +13,7 @@ import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.HashSet;
 import java.util.List;
+import java.util.Locale;
 import java.util.Set;
 import java.util.TreeSet;
 import java.util.UUID;
@@ -105,7 +106,11 @@ public final class ProjectLibrary {
         JSONArray nodes = story.getJSONArray("nodes");
         for (int i = 0; i < nodes.length(); i++) {
             JSONObject node = nodes.getJSONObject(i);
-            node.put("demoArt", story.getBoolean("demo") ? artFor(story, node) : "");
+            if (story.getBoolean("demo")) {
+                node.put("demoArt", artFor(story, node));
+            } else {
+                node.remove("demoArt");
+            }
         }
     }
 
@@ -264,8 +269,25 @@ public final class ProjectLibrary {
     }
 
     public static String artFor(JSONObject story, JSONObject node) {
-        if (story == null || node == null || !story.optBoolean("demo", false)) {
+        if (story == null || node == null) {
             return null;
+        }
+        if (!story.optBoolean("demo", false)) {
+            String scene = (node.optString("title", "") + " " + node.optString("text", "")
+                    + " " + node.optString("image_prompt", "")).toLowerCase(Locale.ROOT);
+            if (scene.matches("(?s).*(车站|站台|列车|火车|旅途|旅行|旅程|机场|码头|\\b(station|platform|train|journey|travel|airport|harbor)\\b).*")) {
+                return "rain_station";
+            }
+            if (scene.matches("(?s).*(室内|屋内|档案|办公|办公室|酒吧|书房|图书馆|\\b(indoor|indoors|interior|archive|archives|office|bar|pub|library)\\b).*")) {
+                return "rain_archive";
+            }
+            if (scene.matches("(?s).*(月亮|月光|屋顶|天台|露台|\\b(moon|moonlight|rooftop|roof|terrace)\\b).*")) {
+                return "rain_rooftop";
+            }
+            if (scene.matches("(?s).*(城市|都市|街道|街头|雨城|宴会|晚宴|\\b(city|urban|street|banquet|gala)\\b).*")) {
+                return "rain_city";
+            }
+            return ARTS[Math.max(0, node.optInt("depth", 0)) % ARTS.length];
         }
         if (MbtiStory.isStory(story)) {
             return MBTI_ARTS[Math.max(0, Math.min(node.optInt("depth", 0), MBTI_ARTS.length - 1))];
@@ -368,7 +390,11 @@ public final class ProjectLibrary {
             } else if (train) {
                 node.put("text", node.getString("text").replace("【本地固定示例，非模型生成】", ""));
             }
-            node.put("demoArt", demo ? artFor(story, node) : "");
+            if (demo) {
+                node.put("demoArt", artFor(story, node));
+            } else {
+                node.remove("demoArt");
+            }
         }
     }
 
